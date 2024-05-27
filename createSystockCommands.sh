@@ -11,7 +11,7 @@ cat << 'EOF' > $SYSTOCK_FILE
 PENTAHO_PAN="/opt/pentaho/client-tools/data-integration/pan.sh"
 PENTAHO_KITCHEN="/opt/pentaho/client-tools/data-integration/kitchen.sh"
 ARQ="/opt/pentaho/client-tools/data-integration/integracoes"
-
+PATH_SYSTOCK="integracao_auto"
 # Cores ANSI
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -23,11 +23,80 @@ function show_help() {
     echo -e "${YELLOW}Uso: systock [comando] [argumentos]${NC}"
     echo ""
     echo "Comandos disponíveis:"
-    echo -e "  ${GREEN}integracao [nome]${NC}           - Executa a integração para o nome (nome pode ser 'diario', 'hora' para job ou qualquer outro para tabelas)"
+    echo -e "  ${GREEN}integracao [nome]${NC}           - Executa a integração para o nome (nome pode ser 'diário', 'hora' para job ou qualquer outro para tabelas)"
     echo -e "  ${GREEN}limpar cache${NC}                - Limpa o cache"
     echo -e "  ${GREEN}verificar${NC}                   - Verifica os requisitos do servidor"
+    echo -e "  ${GREEN}iniciar${NC}                     - Inicia os serviços do Pentaho e configura o arquivo kettle.properties"
+    echo -e "  ${GREEN}base [criar|remover|restaurar]${NC} - Cria, remove ou restaura a base de dados e usuário 'systock'"
+    echo -e "  ${GREEN}configurar-banco${NC}            - Configura o PostgreSQL para ser acessível externamente"
     echo -e "  ${GREEN}help${NC}                        - Exibe esta mensagem de ajuda"
 }
+
+# Função para restaurar
+function restaurar_dump() {
+    # Pergunta ao usuário a versão do dump
+    read -p "Qual a versão do arquivo de importação? " version
+
+    # Define o caminho do arquivo
+    local dump_file="/tmp/systock_homolgado_v${version}.dmp"
+
+    # Verifica se o arquivo existe
+    if [[ ! -f "$dump_file" ]]; then
+        echo -e "${RED}Arquivo $dump_file não encontrado.${NC}"
+        return 1
+    fi
+
+    # Executa o pg_restore
+    echo "Restaurando o banco de dados a partir de $dump_file..."
+    pg_restore -v -d systock "$dump_file"
+
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}Banco de dados restaurado com sucesso.${NC}"
+    else
+        echo -e "${RED}Falha ao restaurar o banco de dados.${NC}"
+    fi
+}
+
+#Liberar Banco
+function liberar_banco() {
+    # Caminho dos arquivos de configuração do PostgreSQL
+    local postgresql_conf="/etc/postgresql/16/main/postgresql.conf"
+    local pg_hba_conf="/etc/postgresql/16/main/pg_hba.conf"
+    local backup_postgresql_conf="/etc/postgresql/16/main/postgresql.conf.backup"
+    local backup_pg_hba_conf="/etc/postgresql/16/main/pg_hba.conf.backup"
+
+    # Verificando se os arquivos de configuração existem
+    if [[ ! -f "$postgresql_conf" ]] || [[ ! -f "$pg_hba_conf" ]]; then
+        echo -e "${RED}Arquivo de configuração não encontrado. Verifique a instalação do PostgreSQL e a versão especificada.${NC}"
+        return 1
+    fi
+
+    # Fazendo backup dos arquivos de configuração
+    echo "Criando backup dos arquivos de configuração..."
+    [[ ! -f "$backup_postgresql_conf" ]] && cp "$postgresql_conf" "$backup_postgresql_conf"
+    [[ ! -f "$backup_pg_hba_conf" ]] && cp "$pg_hba_conf" "$backup_pg_hba_conf"
+
+    # Modificando postgresql.conf para permitir acessos externos
+    echo "Modificando postgresql.conf para permitir acessos externos..."
+    sed -i "s/^#listen_addresses = 'localhost'/listen_addresses = '*'/" "$postgresql_conf"
+    if ! grep -q "listen_addresses = '\*'" "$postgresql_conf"; then
+        echo -e "${RED}Falha ao modificar postgresql.conf. Restaurando backup...${NC}"
+        cp "$backup_postgresql_conf" "$postgresql_conf"
+        return 1
+    fi
+
+    # Modificando pg_hba.conf para permitir autenticação via MD5 de qualquer IP
+    echo "Adicionando regra em pg_hba.conf para autenticação via MD5..."
+    echo "host    all             all             0.0.0.0/0               md5" >> "$pg_hba_conf"
+    if ! grep -q "host    all             all             0.0.0.0/0               md5" "$pg_hba_conf"; then
+        echo -e "${RED}Falha ao adicionar regra em pg_hba.conf. Restaurando backup...${NC}"
+        cp "$backup_pg_hba_conf" "$pg_hba_conf"
+        return 1
+    fi
+
+    echo -e "${GREEN}Configurações alteradas com sucesso. Por favor, reinicie o serviço do PostgreSQL para aplicar as mudanças.${NC}"
+}
+
 
 # Função para executar a integração
 function integracao() {
@@ -62,7 +131,7 @@ function criar_arquivo_kettle_properties() {
 # Função para executar a integração de jobs (Função adicionada)
 function integracao_tabela_job() {
     local nome=$1
-    if ! sh "$PENTAHO_KITCHEN" -file="$ARQ/integracao_winthor_job_${nome}.kjb"; then
+    if ! sh "$PENTAHO_KITCHEN" -file="$ARQ/${PATH_SYSTOCK}_job_${nome}.kjb"; then
         echo -e "${RED}Erro ao executar a integração de job: $nome${NC}"
         exit 1
     fi
@@ -71,7 +140,7 @@ function integracao_tabela_job() {
 # Função para executar a integração de tasks
 function integracao_tabela_task() {
     local nome=$1
-    if ! sh "$PENTAHO_PAN" -file="$ARQ/integracao_winthor_tabela_${nome}.ktr"; then
+    if ! sh "$PENTAHO_PAN" -file="$ARQ/${PATH_SYSTOCK}_tabela_${nome}.ktr"; then
         echo -e "${RED}Erro ao executar a integração de task: $nome${NC}"
         exit 1
     fi
@@ -88,6 +157,19 @@ function limpar_cache() {
 # Função para verificar os requisitos do servidor
 function verificar_requisitos() {
     local mem_total=$(free -g | awk '/^Mem:/ { print $2 }')
+
+    # Segunda tentativa caso a primeira falhe
+    if [ -z "$mem_total" ] || [ "$mem_total" -eq 0 ]; then
+        local mem_total=$(free -g | awk '/^Mem.:/ { print $2 }')
+    fi
+
+    # Tentativa usando /proc/meminfo se necessário
+    if [ -z "$mem_total" ] || [ "$mem_total" -eq 0 ]; then
+        # Captura a memória total em kB e converte para GB, assumindo que 1 GB = 1024 * 1024 kB
+       local mem_total_kb=$(grep MemTotal /proc/meminfo | awk '{ print $2 }')
+       local mem_total=$(echo "$mem_total_kb / 1024 / 1024" | bc)
+    fi
+
     local hd_total=$(df -BG --total | grep 'total' | awk '{print $2}' | sed 's/G//')
     local num_cores=$(nproc)
 
@@ -121,6 +203,66 @@ function verificar_requisitos() {
     fi
 }
 
+function configura_kettle_properties() {
+    # Define o caminho do arquivo
+    local file_path="/home/systock/.kettle/kettle.properties"
+
+    # Solicita os dados de origem do usuário
+    read -p "Digite o host de origem: " origem_host
+    read -p "Digite o nome do banco de dados de origem: " origem_banco
+    read -p "Digite o usuário de origem: " origem_usuario
+    while true; do
+        read -s -p "Digite a senha de origem: " origem_password
+        echo
+        read -s -p "Confirme a senha de origem: " password_confirm
+        echo
+        if [[ "$origem_password" == "$password_confirm" ]]; then
+            break
+        else
+            echo "As senhas não correspondem. Tente novamente."
+        fi
+    done
+    read -p "Digite a porta de origem: " origem_port
+    read -p "Digite o nome da empresa para o assunto do e-mail: " empresa
+
+    # Gera o conteúdo do arquivo kettle.properties
+    echo "caminho_integracoes=/opt/pentaho/client-tools/data-integration/integracoes/" > "$file_path"
+    echo "destino_host=localhost" >> "$file_path"
+    echo "destino_banco=systock" >> "$file_path"
+    echo "destino_usuario=systock" >> "$file_path"
+    echo "destino_password=sys2017tock" >> "$file_path"
+    echo "destino_port=5432" >> "$file_path"
+    echo "" >> "$file_path"
+    echo "origem_host=$origem_host" >> "$file_path"
+    echo "origem_banco=$origem_banco" >> "$file_path"
+    echo "origem_usuario=$origem_usuario" >> "$file_path"
+    echo "origem_password=$origem_password" >> "$file_path"
+    echo "origem_port=$origem_port" >> "$file_path"
+    echo "" >> "$file_path"
+    echo "email_integracao=integracao@systock.com.br" >> "$file_path"
+    echo "email_autenticacao=Sys2022!" >> "$file_path"
+    echo "email_assunto=Erro de Integracao Systock - $empresa" >> "$file_path"
+    echo "email_destino=ti@systock.com.br" >> "$file_path"
+    echo "email_destino_bc=mauro.lima@systock.com.br" >> "$file_path"
+
+    echo -e "${GREEN}Arquivo kettle.properties configurado com sucesso.${NC}"
+}
+
+# Criar base
+function criar_base() {
+    sudo -u postgres psql -c "CREATE ROLE systock SUPERUSER LOGIN PASSWORD '123';"
+    sudo -u postgres psql -c "CREATE DATABASE systock OWNER systock;"
+    echo -e "${GREEN}Base de dados e usuário 'systock' criados com sucesso.${NC}"
+}
+
+# Remover base
+
+function remover_base() {
+    sudo -u postgres psql -c "DROP DATABASE IF EXISTS systock;"
+    sudo -u postgres psql -c "DROP ROLE IF EXISTS systock;"
+    echo -e "${GREEN}Base de dados e usuário 'systock' removidos com sucesso.${NC}"
+}
+
 # Verifica o comando passado
 case "$1" in
     integracao)
@@ -138,6 +280,30 @@ case "$1" in
     verificar)
         verificar_requisitos
         ;;
+    iniciar)
+        configura_kettle_properties
+        ;;
+    base)
+        case "$2" in
+            criar)
+                criar_base
+                ;;
+            remover)
+                remover_base
+                ;;
+            restaurar)
+                restaurar_dump
+                ;;
+            *)
+                echo -e "${RED}Comando inválido para base: $2${NC}"
+                show_help
+                exit 1
+                ;;
+        esac
+        ;;
+    configurar-banco)
+        liberar_banco
+        ;;
     help|/help|-h|--help)
         show_help
         ;;
@@ -149,6 +315,8 @@ case "$1" in
 esac
 EOF
 
+
+
 # Torna o arquivo executável
 chmod +x $SYSTOCK_FILE
 
@@ -157,36 +325,50 @@ cat << 'EOF' >> ~/.bashrc
 
 # Autocomplete para o comando systock
 _systock_autocomplete() {
-    local cur prev opts
+    local cur prev opts files
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    case "${COMP_CWORD}" in
-        2)
-            opts="integracao limpar verificar help"
-            COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
-            return 0
-            ;;
-        3)
-            if [[ "${prev}" == "integracao" ]]; then
-                files=$(ls /opt/pentaho/client-tools/data-integration/integracoes/integracao_auto_job_*.kjb 2>/dev/null | xargs -n 1 basename | sed 's/integracao_auto_job_\(.*\)\.kjb/\1/')
-                files+=" $(ls /opt/pentaho/client-tools/data-integration/integracoes/integracao_auto_tabela_*.ktr 2>/dev/null | xargs -n 1 basename | sed 's/integracao_auto_tabela_\(.*\)\.ktr/\1/')"
-                COMPREPLY=( $(compgen -W "${files}" -- ${cur}) )
-                return 0
-            fi
-            if [[ "${prev}" == "limpar" ]]; then
-                COMPREPLY=( $(compgen -W "cache" -- ${cur}) )
-                return 0
-            fi
-            ;;
-    esac
+    # Basic options for the main command
+    if [[ "${COMP_CWORD}" == 1 ]]; then
+        opts="integracao limpar verificar iniciar base configurar-banco help"
+        COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
+        return 0
+    fi
+
+    # Options for the 'integracao' sub-command
+    if [[ "${prev}" == "integracao" ]]; then
+        files=$(ls /opt/pentaho/client-tools/data-integration/integracoes/integracao_auto_job_*.kjb 2>/dev/null | xargs -n 1 basename | sed 's/integracao_auto_job_\(.*\)\.kjb/\1/')
+        files+=" $(ls /opt/pentaho/client-tools/data-integration/integracoes/integracao_auto_tabela_*.ktr 2>/dev/null | xargs -n 1 basename | sed 's/integracao_auto_tabela_\(.*\)\.ktr/\1/')"
+
+        if [[ -z "$files" ]]; then
+            files="diario hora apoio produtos entradas consumos"
+        fi
+        
+        COMPREPLY=( $(compgen -W "${files}" -- ${cur}) )
+        return 0
+    fi
+
+    # Options for the 'limpar' sub-command
+    if [[ "${prev}" == "limpar" ]]; then
+        COMPREPLY=( $(compgen -W "cache" -- ${cur}) )
+        return 0
+    fi
+
+    # Options for the 'base' sub-command
+    if [[ "${prev}" == "base" ]]; then
+        opts="criar remover restaurar"
+        COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
+        return 0
+    fi
+
+    # No further options required for 'verificar', 'iniciar', and 'configurar-banco' as they do not have subcommands
 }
 
+# Register the completion function
 complete -F _systock_autocomplete systock
 EOF
 
-# Recarregar as configurações do shell
-source ~/.bashrc
 
-echo -e "${GREEN}O comando systock foi instalado e o autocomplete foi configurado.${NC}"
+echo "${GREEN}O comando systock foi instalado e o autocomplete foi configurado.${NC}"
