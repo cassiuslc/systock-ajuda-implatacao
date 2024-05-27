@@ -3,8 +3,21 @@
 # Variáveis para o script systock
 SYSTOCK_FILE="/usr/local/bin/systock"
 
+# Verifica se o script está sendo executado com privilégios de superusuário
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Este script deve ser executado com privilégios de superusuário (sudo)."
+    exit 1
+fi
+
+# Verifica se o arquivo já existe e remove
+if [ -f "$SYSTOCK_FILE" ]; then
+    echo "Removendo versão antiga do systock..."
+    rm -f $SYSTOCK_FILE
+fi
+
 # Criar o arquivo systock com o conteúdo do comando
 cat << 'EOF' > $SYSTOCK_FILE
+
 #!/bin/bash
 
 # Variáveis globais
@@ -27,7 +40,7 @@ function show_help() {
     echo -e "  ${GREEN}limpar cache${NC}                - Limpa o cache"
     echo -e "  ${GREEN}verificar${NC}                   - Verifica os requisitos do servidor"
     echo -e "  ${GREEN}iniciar${NC}                     - Inicia os serviços do Pentaho e configura o arquivo kettle.properties"
-    echo -e "  ${GREEN}base [criar|remover|restaurar]${NC} - Cria, remove ou restaura a base de dados e usuário 'systock'"
+    echo -e "  ${GREEN}base [criar|remover|restaurar]${NC} - Cria , remove ou restaura a base de dados e usuário 'systock'"
     echo -e "  ${GREEN}configurar-banco${NC}            - Configura o PostgreSQL para ser acessível externamente"
     echo -e "  ${GREEN}help${NC}                        - Exibe esta mensagem de ajuda"
 }
@@ -204,12 +217,32 @@ function verificar_requisitos() {
 }
 
 function configura_kettle_properties() {
-    # Define o caminho do arquivo
-    local file_path="/home/systock/.kettle/kettle.properties"
+    # Define o caminho do diretório e do arquivo
+    local dir_path="/home/systock/.kettle"
+    local file_path="$dir_path/kettle.properties"
+    local backup_path="$dir_path/kettle.properties.backup"
+
+    # Verifica se o usuário atual é 'systock'
+    if [ "$(whoami)" != "systock" ]; then
+        echo -e "${RED}Erro: Este script só pode ser executado pelo usuário 'systock'.${NC}"
+        exit 1
+    fi
+
+    # Cria o diretório .kettle se ele não existir
+    if [ ! -d "$dir_path" ]; then
+        echo "Criando diretório $dir_path..."
+        mkdir -p "$dir_path"
+    fi
+
+    # Verifica se o arquivo kettle.properties existe e cria um backup
+    if [ -f "$file_path" ]; then
+        echo "Criando backup do arquivo existente em $backup_path..."
+        cp "$file_path" "$backup_path"
+    fi
 
     # Solicita os dados de origem do usuário
     read -p "Digite o host de origem: " origem_host
-    read -p "Digite o nome do banco de dados de origem: " origem_banco
+    read -p "Digite o nome do banco de dados de origem (Caminho): " origem_banco
     read -p "Digite o usuário de origem: " origem_usuario
     while true; do
         read -s -p "Digite a senha de origem: " origem_password
@@ -222,28 +255,38 @@ function configura_kettle_properties() {
             echo "As senhas não correspondem. Tente novamente."
         fi
     done
-    read -p "Digite a porta de origem: " origem_port
+    read -p "Digite a porta do banco de origem: " origem_port
     read -p "Digite o nome da empresa para o assunto do e-mail: " empresa
 
+    # Verificação se o caminho é do tipo Windows
+    if [[ "$origem_banco" =~ ^[a-zA-Z]:\\ ]]; then
+        # Substitui cada barra invertida por quatro barras invertidas
+        # Isso é necessário para que o 'echo' processe corretamente e exiba duas barras invertidas
+        origem_banco="${origem_banco//\\/\\\\\\\\}"
+    fi
+
+
     # Gera o conteúdo do arquivo kettle.properties
-    echo "caminho_integracoes=/opt/pentaho/client-tools/data-integration/integracoes/" > "$file_path"
-    echo "destino_host=localhost" >> "$file_path"
-    echo "destino_banco=systock" >> "$file_path"
-    echo "destino_usuario=systock" >> "$file_path"
-    echo "destino_password=sys2017tock" >> "$file_path"
-    echo "destino_port=5432" >> "$file_path"
-    echo "" >> "$file_path"
-    echo "origem_host=$origem_host" >> "$file_path"
-    echo "origem_banco=$origem_banco" >> "$file_path"
-    echo "origem_usuario=$origem_usuario" >> "$file_path"
-    echo "origem_password=$origem_password" >> "$file_path"
-    echo "origem_port=$origem_port" >> "$file_path"
-    echo "" >> "$file_path"
-    echo "email_integracao=integracao@systock.com.br" >> "$file_path"
-    echo "email_autenticacao=Sys2022!" >> "$file_path"
-    echo "email_assunto=Erro de Integracao Systock - $empresa" >> "$file_path"
-    echo "email_destino=ti@systock.com.br" >> "$file_path"
-    echo "email_destino_bc=mauro.lima@systock.com.br" >> "$file_path"
+    {
+        echo "caminho_integracoes=/opt/pentaho/client-tools/data-integration/integracoes/"
+        echo "destino_host=localhost"
+        echo "destino_banco=systock"
+        echo "destino_usuario=systock"
+        echo "destino_password=sys2017tock"
+        echo "destino_port=5432"
+        echo ""
+        echo "origem_host=$origem_host"
+        echo "origem_banco=$origem_banco"
+        echo "origem_usuario=$origem_usuario"
+        echo "origem_password=$origem_password"
+        echo "origem_port=$origem_port"
+        echo ""
+        echo "email_integracao=integracao@systock.com.br"
+        echo "email_autenticacao=Sys2022!"
+        echo "email_assunto=Erro de Integracao Systock - $empresa"
+        echo "email_destino=ti@systock.com.br"
+        echo "email_destino_bc=mauro.lima@systock.com.br"
+    } > "$file_path"
 
     echo -e "${GREEN}Arquivo kettle.properties configurado com sucesso.${NC}"
 }
@@ -314,8 +357,6 @@ case "$1" in
         ;;
 esac
 EOF
-
-
 
 # Torna o arquivo executável
 chmod +x $SYSTOCK_FILE
